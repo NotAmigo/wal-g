@@ -35,14 +35,7 @@ type MongodService struct {
 func CreateMongodService(ctx context.Context, appName, mongodbURI string, timeout time.Duration) (*MongodService, error) {
 	mongoClient, err := backoff.Retry(ctx,
 		func() (*mongo.Client, error) {
-			// v2 dropped SocketTimeout, client-wide SetTimeout would bound backup cursor lifetime, rely on ctx instead
-			client, err := mongo.Connect(
-				options.Client().ApplyURI(mongodbURI).
-					SetServerSelectionTimeout(timeout).
-					SetConnectTimeout(timeout).
-					SetAppName(appName).
-					SetDirect(true).
-					SetRetryReads(false))
+			client, err := mongo.Connect(mongodClientOptions(appName, mongodbURI, timeout))
 			if err != nil {
 				return nil, errors.Wrap(err, "unable to connect to mongod")
 			}
@@ -64,6 +57,16 @@ func CreateMongodService(ctx context.Context, appName, mongodbURI string, timeou
 		Context:     ctx,
 		MongoClient: mongoClient,
 	}, nil
+}
+
+func mongodClientOptions(appName, mongodbURI string, timeout time.Duration) *options.ClientOptions {
+	// A client-wide timeout would interrupt opening a backup cursor while MongoDB is finishing a long checkpoint.
+	return options.Client().ApplyURI(mongodbURI).
+		SetServerSelectionTimeout(timeout).
+		SetConnectTimeout(timeout).
+		SetAppName(appName).
+		SetDirect(true).
+		SetRetryReads(false)
 }
 
 func CreateBackgroundMongodService(ctx context.Context, appName, mongodbURI string) (*MongodService, error) {
@@ -158,10 +161,14 @@ func (mongodService *MongodService) GetBackupCursor() (cursor *mongo.Cursor, err
 		if !backupCursorErrorIsRetried(err) {
 			return nil, err
 		}
-		if i < cursorCreateRetries {
+		if i+1 < cursorCreateRetries {
 			minutes := time.Duration(i + 1)
 			tracelog.WarningLogger.Printf("%+v. Sleep %d minutes and retry", err, minutes)
-			time.Sleep(time.Minute * minutes)
+			select {
+			case <-mongodService.Context.Done():
+				return nil, mongodService.Context.Err()
+			case <-time.After(time.Minute * minutes):
+			}
 		}
 	}
 
